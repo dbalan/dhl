@@ -1,6 +1,4 @@
 """Track packages from dhl via api"""
-from urllib.parse import urlparse
-import json
 import logging
 from datetime import timedelta
 
@@ -19,7 +17,6 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.util.json import load_json
 from homeassistant.helpers.json import save_json
-from homeassistant.util import Throttle
 from homeassistant.helpers.entity_component import EntityComponent
 
 
@@ -46,16 +43,19 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
 
 ATTR_PACKAGE_ID = "package_id"
 
+# Optional package name
+ATTR_PACKAGE_NAME = "package_name"
+
 SUBSCRIPTION_SCHEMA = vol.All(
     {
         vol.Required(ATTR_PACKAGE_ID): cv.string,
+        vol.Optional(ATTR_PACKAGE_NAME): cv.string,
     }
 )
 
 ENTITY_ID_FORMAT = DOMAIN + ".{}"
 
 DHL_API_track_shipments_URL = "https://api-eu.dhl.com/track/shipments?language=en&trackingNumber={}"
-
 
 async def async_setup_platform(hass, config, async_add_entities, discovery_info=None):
     """Setup the dhl sensor"""
@@ -72,21 +72,33 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
     registrations = _load_config(json_path)
 
+    # check if we are migrating from old config
+    if len(registrations) > 0 and isinstance(registrations[0], str):
+        # migrate the config to dictionary, and write back
+        registrations = [{"package_id": x} for x in registrations]
+        await hass.async_add_job(save_json, json_path, registrations)
+
     api_key = config.get(ATTR_API_KEY)
 
     async def async_service_register(service):
         """Handle package registration."""
         package_id = service.data.get(ATTR_PACKAGE_ID).upper()
+        package_name = service.data.get(ATTR_PACKAGE_NAME)
 
-        if package_id in registrations:
+        if _lookup_package_data(package_id, registrations) is not None:
             raise ValueError("Package allready tracked")
 
-        registrations.append(package_id)
+        package_data = { "package_id": package_id }
+        if package_name:
+            package_data["package_name"] = package_name
+
+        registrations.append(package_data)
 
         await hass.async_add_job(save_json, json_path, registrations)
 
+
         return await component.async_add_entities([
-            DHLSensor(hass, package_id, api_key)])
+            DHLSensor(hass, api_key, package_id, package_name)])
 
     hass.services.async_register(
         DOMAIN,
@@ -99,7 +111,12 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
         """Handle package registration."""
         package_id = service.data.get(ATTR_PACKAGE_ID)
 
-        registrations.remove(package_id)
+        package_data = _lookup_package_data(package_id, registrations)
+
+        if not package_data:
+            raise ValueError("Package not tracked")
+
+        registrations.remove(package_data)
 
         await hass.async_add_job(save_json, json_path, registrations)
 
@@ -117,7 +134,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     if registrations is None:
         return None
 
-    return await component.async_add_entities([DHLSensor(hass, package_id, api_key) for package_id in registrations], False)
+    return await component.async_add_entities([DHLSensor(hass, api_key, package_data.get("package_id"), package_data.get("package_name")) for package_data in registrations], False)
 
 
 def _load_config(filename):
@@ -128,14 +145,21 @@ def _load_config(filename):
         pass
     return []
 
+def _lookup_package_data(package_id, current_registrations):
+    for reg in current_registrations:
+        if reg["package_id"] == package_id:
+            return reg
+    return None
+
 
 class DHLSensor(RestoreEntity):
     """DHL Sensor."""
 
-    def __init__(self, hass, package_id, api_key):
+    def __init__(self, hass, api_key, package_id, package_name=None):
         """Initialize the sensor."""
         self.hass = hass
         self._package_id = package_id
+        self._package_name = package_name
         self._api_key = api_key
         self._attributes = None
         self._state = None
@@ -149,6 +173,9 @@ class DHLSensor(RestoreEntity):
     @property
     def name(self):
         """Return the name of the sensor."""
+        if self._package_name:
+            return "Package {}".format(self._package_name)
+
         return "Package {}".format(self._package_id)
 
     @property
